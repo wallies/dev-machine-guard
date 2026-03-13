@@ -2,6 +2,7 @@ mod detect;
 mod enterprise;
 mod node_scan;
 mod output;
+mod platform;
 mod types;
 mod util;
 
@@ -9,6 +10,7 @@ use std::io::{self, Write};
 use std::process;
 use std::time::Instant;
 
+use platform::*;
 use types::*;
 use util::*;
 
@@ -36,7 +38,7 @@ fn main() {
         match cmd {
             EnterpriseCommand::SendTelemetry => {
                 if !enterprise::is_enterprise_mode(&config) {
-                    print_error("Enterprise configuration not found. Please download the script from your StepSecurity dashboard.");
+                    print_error("Enterprise configuration not found. Please download the binary from your StepSecurity dashboard.");
                     process::exit(1);
                 }
                 enterprise::run_telemetry(&config);
@@ -46,17 +48,17 @@ fn main() {
                 println!();
 
                 if !enterprise::is_enterprise_mode(&config) {
-                    print_error("Enterprise configuration not found. Please download the script from your StepSecurity dashboard.");
+                    print_error("Enterprise configuration not found. Please download the binary from your StepSecurity dashboard.");
                     process::exit(1);
                 }
 
-                if enterprise::is_launchd_configured() {
+                if enterprise::is_scheduling_configured() {
                     eprintln!("Existing agent installation detected. Upgrading...");
-                    enterprise::uninstall_launchd();
+                    enterprise::uninstall_scheduling();
                     eprintln!("Previous installation removed. Installing new version...");
                 }
 
-                match enterprise::configure_launchd(&config) {
+                match enterprise::configure_scheduling(&config) {
                     Ok(()) => {
                         println!();
                         eprintln!("Installation complete!");
@@ -79,12 +81,12 @@ fn main() {
                 println!("StepSecurity Dev Machine Guard v{}", AGENT_VERSION);
                 println!();
 
-                if !enterprise::is_launchd_configured() {
+                if !enterprise::is_scheduling_configured() {
                     eprintln!("Agent is not currently configured for periodic execution");
                     process::exit(0);
                 }
 
-                enterprise::uninstall_launchd();
+                enterprise::uninstall_scheduling();
                 process::exit(0);
             }
         }
@@ -102,16 +104,6 @@ fn main() {
 }
 
 fn run_scan(config: &Config) {
-    // Verify macOS
-    let uname = run_command("uname", &["-s"], None);
-    if uname != "Darwin" {
-        print_error(&format!(
-            "This scanner only supports macOS (detected: {})",
-            uname
-        ));
-        process::exit(1);
-    }
-
     let scan_start = Instant::now();
     let is_json = config.output_format == OutputFormat::Json;
     let verbose = config.verbose;
@@ -124,31 +116,34 @@ fn run_scan(config: &Config) {
 
     // Step 1: Gather device information
     step_start("Gathering device information", is_json);
-    let serial_number = enterprise::get_serial_number();
-    let os_version = enterprise::get_os_version();
-    let hostname = run_command("hostname", &[], None);
-    let (logged_in_user, user_home) = enterprise::get_logged_in_user_info();
+    let serial_number = get_serial_number();
+    let os_version = get_os_version();
+    let hostname = get_hostname();
+    let username = current_username();
+    let user_home = home_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
 
-    if logged_in_user.is_empty() || user_home.is_empty() {
-        print_error("No user currently logged in to console. Cannot scan.");
+    if user_home.is_empty() {
+        print_error("Cannot determine user home directory. Cannot scan.");
         process::exit(1);
     }
 
-    let developer_identity = enterprise::get_developer_identity(&logged_in_user);
+    let developer_identity = get_developer_identity(&username);
     step_done("Gathering device information", is_json, &scan_start);
 
     // Step 2: Detect IDEs & desktop apps
     let step_time = Instant::now();
     step_start("Scanning IDEs & desktop apps", is_json);
-    let ide_installations = detect::detect_ide_installations(&logged_in_user, verbose);
+    let ide_installations = detect::detect_ide_installations(verbose);
     step_done("Scanning IDEs & desktop apps", is_json, &step_time);
 
     // Step 3: Detect AI agents and tools
     let step_time = Instant::now();
     step_start("Scanning AI agents & CLI tools", is_json);
-    let ai_cli_tools = detect::detect_ai_cli_tools(&logged_in_user, &user_home, verbose);
-    let general_ai_agents = detect::detect_general_ai_agents(&user_home, verbose);
-    let ai_frameworks = detect::detect_ai_frameworks(&logged_in_user, verbose);
+    let ai_cli_tools = detect::detect_ai_cli_tools(verbose);
+    let general_ai_agents = detect::detect_general_ai_agents(verbose);
+    let ai_frameworks = detect::detect_ai_frameworks(verbose);
     step_done("Scanning AI agents & CLI tools", is_json, &step_time);
 
     // Merge AI tools
@@ -160,29 +155,16 @@ fn run_scan(config: &Config) {
     // Step 4: MCP configs
     let step_time = Instant::now();
     step_start("Scanning MCP server configs", is_json);
-    let jq_available = command_available("jq");
-    let perl_available = command_available("perl");
-    let mcp_configs = if jq_available && perl_available {
-        detect::collect_mcp_configs(
-            &user_home,
-            enterprise::is_enterprise_mode(config),
-            jq_available,
-            perl_available,
-            verbose,
-        )
-    } else {
-        print_error(&format!(
-            "Skipping MCP config collection (jq={}, perl={})",
-            jq_available, perl_available
-        ));
-        vec![]
-    };
+    let mcp_configs = detect::collect_mcp_configs(
+        enterprise::is_enterprise_mode(config),
+        verbose,
+    );
     step_done("Scanning MCP server configs", is_json, &step_time);
 
     // Step 5: IDE extensions
     let step_time = Instant::now();
     step_start("Scanning IDE extensions", is_json);
-    let ide_extensions = detect::collect_ide_extensions(&user_home, verbose);
+    let ide_extensions = detect::collect_ide_extensions(verbose);
     step_done("Scanning IDE extensions", is_json, &step_time);
 
     // Step 6: Node.js scanning
@@ -200,18 +182,17 @@ fn run_scan(config: &Config) {
     if enable_npm {
         let step_time = Instant::now();
         step_start("Detecting Node.js package managers", is_json);
-        node_package_managers = node_scan::detect_package_managers(&logged_in_user, verbose);
+        node_package_managers = node_scan::detect_package_managers(verbose);
         step_done("Detecting Node.js package managers", is_json, &step_time);
 
         let step_time = Instant::now();
         step_start("Scanning global packages", is_json);
-        node_global_scans = node_scan::scan_global_packages(&logged_in_user, verbose);
+        node_global_scans = node_scan::scan_global_packages(verbose);
         step_done("Scanning global packages", is_json, &step_time);
 
         let step_time = Instant::now();
         step_start("Scanning Node.js projects", is_json);
-        let (scans, count) =
-            node_scan::scan_node_projects(&user_home, &logged_in_user, verbose);
+        let (scans, count) = node_scan::scan_node_projects(&user_home, verbose);
         node_project_scans = scans;
         node_projects_count = count;
         step_done("Scanning Node.js projects", is_json, &step_time);
@@ -231,7 +212,7 @@ fn run_scan(config: &Config) {
             hostname,
             serial_number,
             os_version,
-            platform: "darwin".to_string(),
+            platform: platform_string().to_string(),
             user_identity: developer_identity,
         },
         ide_installations,
@@ -379,15 +360,17 @@ fn show_help() {
     eprintln!(
         r#"StepSecurity Dev Machine Guard v{}
 
-Scans your macOS developer environment for IDEs, AI tools, extensions,
+Scans your developer environment for IDEs, AI tools, extensions,
 MCP servers, and security issues. Outputs results locally or sends
 telemetry to StepSecurity backend (enterprise mode).
+
+Supports macOS, Linux, and Windows.
 
 Usage: {} [COMMAND] [OPTIONS]
 
 Commands (enterprise only):
-  install              Install launchd for periodic scanning
-  uninstall            Remove launchd configuration
+  install              Install periodic scanning (launchd/systemd/Task Scheduler)
+  uninstall            Remove periodic scanning configuration
   send-telemetry       Send scan data to StepSecurity backend
 
 Output formats (community mode, mutually exclusive):

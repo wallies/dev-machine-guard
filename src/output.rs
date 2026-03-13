@@ -2,6 +2,7 @@ use std::fs;
 use std::io;
 
 use crate::node_scan::extract_packages_from_scans;
+use crate::platform::*;
 use crate::types::*;
 use crate::util::*;
 
@@ -11,13 +12,13 @@ pub fn format_json_output(results: &ScanResults) -> String {
     let scan_ts = timestamp_secs();
     let scan_iso = timestamp_to_iso(scan_ts);
 
-    let all_scans: Vec<&NodeProjectScan> = results
+    let all_scans: Vec<NodeProjectScan> = results
         .node_global_scans
         .iter()
         .chain(results.node_project_scans.iter())
+        .cloned()
         .collect();
-    let all_scans_owned: Vec<NodeProjectScan> = all_scans.into_iter().cloned().collect();
-    let node_packages = extract_packages_from_scans(&all_scans_owned);
+    let node_packages = extract_packages_from_scans(&all_scans);
 
     let output = ScanOutput {
         agent_version: AGENT_VERSION.to_string(),
@@ -46,21 +47,19 @@ pub fn format_json_output(results: &ScanResults) -> String {
 // ─── Pretty Output ──────────────────────────────────────────────────────────
 
 pub fn format_pretty_output(results: &ScanResults, color_mode: &ColorMode) {
-    let is_tty = unsafe { libc::isatty(libc::STDOUT_FILENO) != 0 };
+    let is_tty = stdout_is_tty();
     let use_colors = should_use_colors(color_mode, is_tty);
 
-    let (p, g, b, d, r, _rd, _y) = if use_colors {
+    let (p, g, b, d, r) = if use_colors {
         (
             "\x1b[0;35m",  // Purple
             "\x1b[0;32m",  // Green
             "\x1b[1m",     // Bold
             "\x1b[2m",     // Dim
             "\x1b[0m",     // Reset
-            "\x1b[0;31m",  // Red
-            "\x1b[0;33m",  // Yellow
         )
     } else {
-        ("", "", "", "", "", "", "")
+        ("", "", "", "", "")
     };
 
     let scan_ts = timestamp_secs();
@@ -90,10 +89,17 @@ pub fn format_pretty_output(results: &ScanResults, color_mode: &ColorMode) {
     println!();
 
     // DEVICE section
+    let os_label = match current_platform() {
+        Platform::MacOS => "macOS",
+        Platform::Linux => "Linux",
+        Platform::Windows => "Windows",
+        Platform::Unknown => "OS",
+    };
+
     println!("  {p}{b}DEVICE{r}");
     println!("    {:<16} {}", "Hostname", results.device.hostname);
     println!("    {:<16} {}", "Serial", results.device.serial_number);
-    println!("    {:<16} {}", "macOS", results.device.os_version);
+    println!("    {:<16} {}", os_label, results.device.os_version);
     println!("    {:<16} {}", "User", results.device.user_identity);
     println!();
 
@@ -297,6 +303,13 @@ pub fn generate_html_report(output_file: &str, results: &ScanResults) -> io::Res
     let ide_count = results.ide_installations.len();
     let ext_count = results.ide_extensions.len();
 
+    let os_label = match current_platform() {
+        Platform::MacOS => "macOS",
+        Platform::Linux => "Linux",
+        Platform::Windows => "Windows",
+        Platform::Unknown => "OS",
+    };
+
     let h_hostname = html_escape(&results.device.hostname);
     let h_serial = html_escape(&results.device.serial_number);
     let h_os = html_escape(&results.device.os_version);
@@ -490,7 +503,7 @@ pub fn generate_html_report(output_file: &str, results: &ScanResults) -> io::Res
 <div class="device-grid">
   <div class="field"><span class="field-label">Hostname</span><span class="field-value">{h_hostname}</span></div>
   <div class="field"><span class="field-label">Serial</span><span class="field-value">{h_serial}</span></div>
-  <div class="field"><span class="field-label">macOS</span><span class="field-value">{h_os}</span></div>
+  <div class="field"><span class="field-label">{os_label}</span><span class="field-value">{h_os}</span></div>
   <div class="field"><span class="field-label">User</span><span class="field-value">{h_identity}</span></div>
 </div>
 
@@ -547,6 +560,7 @@ pub fn generate_html_report(output_file: &str, results: &ScanResults) -> io::Res
         ext_count = ext_count,
         mcp_count = mcp_count,
         node_count = results.node_projects_count,
+        os_label = os_label,
         h_hostname = h_hostname,
         h_serial = h_serial,
         h_os = h_os,

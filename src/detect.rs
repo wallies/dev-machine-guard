@@ -1,134 +1,80 @@
 use std::fs;
 use std::path::Path;
 
+use crate::platform::*;
 use crate::types::*;
 use crate::util::*;
 
 // ─── IDE Detection ──────────────────────────────────────────────────────────
 
-struct IdeDefinition {
-    app_name: &'static str,
-    ide_type: &'static str,
-    vendor: &'static str,
-    app_path: &'static str,
-    binary_path: &'static str,
-    version_command: &'static str,
-}
-
-const IDE_DEFINITIONS: &[IdeDefinition] = &[
-    IdeDefinition {
-        app_name: "Visual Studio Code",
-        ide_type: "vscode",
-        vendor: "Microsoft",
-        app_path: "/Applications/Visual Studio Code.app",
-        binary_path: "Contents/Resources/app/bin/code",
-        version_command: "--version",
-    },
-    IdeDefinition {
-        app_name: "Cursor",
-        ide_type: "cursor",
-        vendor: "Cursor",
-        app_path: "/Applications/Cursor.app",
-        binary_path: "Contents/Resources/app/bin/cursor",
-        version_command: "--version",
-    },
-    IdeDefinition {
-        app_name: "Windsurf",
-        ide_type: "windsurf",
-        vendor: "Codeium",
-        app_path: "/Applications/Windsurf.app",
-        binary_path: "Contents/MacOS/Windsurf",
-        version_command: "--version",
-    },
-    IdeDefinition {
-        app_name: "Antigravity",
-        ide_type: "antigravity",
-        vendor: "Google",
-        app_path: "/Applications/Antigravity.app",
-        binary_path: "Contents/MacOS/Antigravity",
-        version_command: "--version",
-    },
-    IdeDefinition {
-        app_name: "Zed",
-        ide_type: "zed",
-        vendor: "Zed",
-        app_path: "/Applications/Zed.app",
-        binary_path: "",
-        version_command: "",
-    },
-    IdeDefinition {
-        app_name: "Claude",
-        ide_type: "claude_desktop",
-        vendor: "Anthropic",
-        app_path: "/Applications/Claude.app",
-        binary_path: "",
-        version_command: "",
-    },
-    IdeDefinition {
-        app_name: "Microsoft Copilot",
-        ide_type: "microsoft_copilot_desktop",
-        vendor: "Microsoft",
-        app_path: "/Applications/Copilot.app",
-        binary_path: "",
-        version_command: "",
-    },
-];
-
-pub fn detect_ide_installations(logged_in_user: &str, verbose: bool) -> Vec<IdeInstallation> {
+pub fn detect_ide_installations(verbose: bool) -> Vec<IdeInstallation> {
     print_progress(verbose, "Detecting IDE and AI desktop app installations...");
     let mut results = Vec::new();
 
-    for ide in IDE_DEFINITIONS {
-        let app_path = Path::new(ide.app_path);
-        if !app_path.is_dir() {
-            continue;
+    for ide in ide_definitions() {
+        let mut found_path: Option<String> = None;
+
+        // Check each candidate path
+        for raw_path in ide.paths {
+            let path_str = expand_home(raw_path);
+            let path = Path::new(&path_str);
+
+            // On macOS: check for .app directories
+            // On Linux/Windows: check for directory or binary
+            if path.exists() {
+                found_path = Some(path_str);
+                break;
+            }
         }
+
+        let install_path = match found_path {
+            Some(p) => p,
+            None => {
+                // Also try finding the binary in PATH
+                if !ide.version_binary.is_empty() {
+                    if let Some(bin_path) = which(ide.version_binary) {
+                        // Found in PATH but no install directory; use binary parent
+                        bin_path
+                            .parent()
+                            .map(|p| p.to_string_lossy().to_string())
+                            .unwrap_or_default()
+                    } else {
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
+            }
+        };
 
         let mut version = String::from("unknown");
 
         // Try to get version from binary
-        if !ide.binary_path.is_empty() && !ide.version_command.is_empty() {
-            let binary_full = format!("{}/{}", ide.app_path, ide.binary_path);
-            if Path::new(&binary_full).exists() {
-                let result = run_as_user(
-                    logged_in_user,
-                    &format!("{:?} {} 2>/dev/null | head -1", binary_full, ide.version_command),
-                    10,
-                );
-                if !result.is_empty() {
-                    version = result.lines().next().unwrap_or("unknown").trim().to_string();
+        if !ide.version_binary.is_empty() && !ide.version_flag.is_empty() {
+            if let Some(bin_path) = which(ide.version_binary) {
+                let ver = get_version(&bin_path.to_string_lossy(), ide.version_flag);
+                if !ver.is_empty() && ver != "unknown" {
+                    version = ver;
                 }
             }
         }
 
-        // Fallback: try Info.plist
+        // Fallback: macOS plist
         if version == "unknown" {
-            let plist_path = format!("{}/Contents/Info.plist", ide.app_path);
-            if Path::new(&plist_path).exists() {
-                let plist_ver = run_command(
-                    "/usr/libexec/PlistBuddy",
-                    &["-c", "Print :CFBundleShortVersionString", &plist_path],
-                    None,
-                );
-                if !plist_ver.is_empty() {
-                    version = plist_ver;
-                }
+            if let Some(plist_ver) = read_plist_version(&install_path) {
+                version = plist_ver;
             }
-        }
-
-        if version.is_empty() {
-            version = "unknown".to_string();
         }
 
         print_progress(
             verbose,
-            &format!("  Found: {} ({}) v{} at {}", ide.app_name, ide.vendor, version, ide.app_path),
+            &format!("  Found: {} ({}) v{} at {}", ide.app_name, ide.vendor, version, install_path),
         );
 
         results.push(IdeInstallation {
             ide_type: ide.ide_type.to_string(),
             version,
-            install_path: ide.app_path.to_string(),
+            install_path,
             vendor: ide.vendor.to_string(),
             is_installed: true,
         });
@@ -143,140 +89,140 @@ pub fn detect_ide_installations(logged_in_user: &str, verbose: bool) -> Vec<IdeI
 
 // ─── AI CLI Tools Detection ─────────────────────────────────────────────────
 
-struct CliToolDefinition {
+struct CliToolDef {
     tool_name: &'static str,
     vendor: &'static str,
     binary_names: &'static [&'static str],
     config_dirs: &'static [&'static str],
+    version_flag: &'static str,
 }
 
-const CLI_TOOL_DEFINITIONS: &[CliToolDefinition] = &[
-    CliToolDefinition {
+const CLI_TOOL_DEFS: &[CliToolDef] = &[
+    CliToolDef {
         tool_name: "claude-code",
         vendor: "Anthropic",
         binary_names: &["claude"],
         config_dirs: &["~/.claude"],
+        version_flag: "--version",
     },
-    CliToolDefinition {
+    CliToolDef {
         tool_name: "codex",
         vendor: "OpenAI",
         binary_names: &["codex"],
         config_dirs: &["~/.codex"],
+        version_flag: "--version",
     },
-    CliToolDefinition {
+    CliToolDef {
         tool_name: "gemini-cli",
         vendor: "Google",
         binary_names: &["gemini"],
         config_dirs: &["~/.gemini"],
+        version_flag: "--version",
     },
-    CliToolDefinition {
+    CliToolDef {
         tool_name: "amazon-q-cli",
         vendor: "Amazon",
         binary_names: &["kiro-cli", "kiro", "q"],
         config_dirs: &["~/.q", "~/.kiro", "~/.aws/q"],
+        version_flag: "--version",
     },
-    CliToolDefinition {
+    CliToolDef {
         tool_name: "github-copilot-cli",
         vendor: "Microsoft",
         binary_names: &["copilot", "gh-copilot"],
         config_dirs: &["~/.config/github-copilot"],
+        version_flag: "--version",
     },
-    CliToolDefinition {
+    CliToolDef {
         tool_name: "microsoft-ai-shell",
         vendor: "Microsoft",
         binary_names: &["aish", "ai"],
         config_dirs: &["~/.aish"],
+        version_flag: "--version",
     },
-    CliToolDefinition {
+    CliToolDef {
         tool_name: "aider",
         vendor: "OpenSource",
         binary_names: &["aider"],
         config_dirs: &["~/.aider"],
+        version_flag: "--version",
     },
-    CliToolDefinition {
+    CliToolDef {
         tool_name: "opencode",
         vendor: "OpenSource",
         binary_names: &["opencode"],
         config_dirs: &["~/.config/opencode"],
+        version_flag: "-v",
     },
 ];
 
-pub fn detect_ai_cli_tools(logged_in_user: &str, user_home: &str, verbose: bool) -> Vec<AiTool> {
+pub fn detect_ai_cli_tools(verbose: bool) -> Vec<AiTool> {
     print_progress(verbose, "Detecting AI CLI tools...");
     let mut results = Vec::new();
 
-    for tool in CLI_TOOL_DEFINITIONS {
-        let mut binary_path = String::new();
+    for tool in CLI_TOOL_DEFS {
+        let mut found_binary: Option<String> = None;
         let mut version = String::from("unknown");
-        let mut found = false;
 
-        // Also check home-relative paths for claude
-        let mut all_binaries: Vec<String> = tool.binary_names.iter().map(|b| b.to_string()).collect();
-        if tool.tool_name == "claude-code" {
-            all_binaries.push(format!("{}/.claude/local/claude", user_home));
-            all_binaries.push(format!("{}/.local/bin/claude", user_home));
-        }
-        if tool.tool_name == "opencode" {
-            all_binaries.push(format!("{}/.opencode/bin/opencode", user_home));
-        }
+        // Search for the binary in PATH
+        for binary_name in tool.binary_names {
+            if let Some(bin_path) = which(binary_name) {
+                let bin_str = bin_path.to_string_lossy().to_string();
 
-        for binary in &all_binaries {
-            let check = if binary.contains('/') {
-                // Absolute path check
-                if Path::new(binary).exists() {
-                    Some(binary.clone())
-                } else {
-                    None
-                }
-            } else {
-                command_exists_for_user(logged_in_user, binary)
-            };
-
-            if let Some(path) = check {
-                binary_path = path;
-                found = true;
-
-                // Get version
-                let version_flag = match tool.tool_name {
-                    "opencode" => "-v",
-                    _ => "--version",
-                };
-
-                // Special handling for amazon-q-cli - verify it's actually Amazon Q
+                // Special: verify amazon-q-cli is actually Amazon Q
                 if tool.tool_name == "amazon-q-cli" {
-                    let verify = run_as_user(
-                        logged_in_user,
-                        &format!("{} --version 2>/dev/null | grep -i 'amazon\\|kiro\\|q developer'", binary),
-                        10,
-                    );
-                    if verify.is_empty() {
-                        found = false;
+                    let ver_output = run_cmd(&bin_str, &["--version"]);
+                    let lower = ver_output.to_lowercase();
+                    if !lower.contains("amazon") && !lower.contains("kiro") && !lower.contains("q developer") {
                         continue;
                     }
                 }
 
-                let ver = run_as_user(
-                    logged_in_user,
-                    &format!("{} {} 2>/dev/null | head -1", binary, version_flag),
-                    10,
-                );
-                if !ver.is_empty() {
-                    version = ver.lines().next().unwrap_or("unknown").trim().to_string();
+                // Get version
+                let ver = get_version(&bin_str, tool.version_flag);
+                if !ver.is_empty() && ver != "unknown" {
+                    version = ver;
                 }
+
+                found_binary = Some(bin_str);
                 break;
             }
         }
 
-        if found {
-            // Check for config directory
-            let mut config_dir = None;
-            for config_candidate in tool.config_dirs {
-                let expanded = config_candidate.replace("~", user_home);
-                if Path::new(&expanded).is_dir() {
-                    config_dir = Some(expanded);
+        // Also check home-relative paths
+        if found_binary.is_none() {
+            let extra_paths: Vec<String> = match tool.tool_name {
+                "claude-code" => vec![
+                    expand_home("~/.claude/local/claude"),
+                    expand_home("~/.local/bin/claude"),
+                ],
+                "opencode" => vec![expand_home("~/.opencode/bin/opencode")],
+                _ => vec![],
+            };
+
+            for extra in &extra_paths {
+                let path = Path::new(extra);
+                if path.is_file() {
+                    let ver = get_version(extra, tool.version_flag);
+                    if !ver.is_empty() && ver != "unknown" {
+                        version = ver;
+                    }
+                    found_binary = Some(extra.clone());
                     break;
                 }
             }
+        }
+
+        if let Some(binary_path) = found_binary {
+            // Find config directory
+            let config_dir = tool.config_dirs.iter().find_map(|dir| {
+                let expanded = expand_home(dir);
+                if Path::new(&expanded).is_dir() {
+                    Some(expanded)
+                } else {
+                    None
+                }
+            });
 
             print_progress(
                 verbose,
@@ -307,51 +253,50 @@ pub fn detect_ai_cli_tools(logged_in_user: &str, user_home: &str, verbose: bool)
 
 // ─── General-Purpose AI Agents Detection ────────────────────────────────────
 
-struct AgentDefinition {
+struct AgentDef {
     agent_name: &'static str,
     vendor: &'static str,
-    detection_dir: &'static str, // relative to home
+    detection_dir: &'static str,
     binary_name: &'static str,
 }
 
-const AGENT_DEFINITIONS: &[AgentDefinition] = &[
-    AgentDefinition { agent_name: "openclaw", vendor: "OpenSource", detection_dir: ".openclaw", binary_name: "openclaw" },
-    AgentDefinition { agent_name: "clawdbot", vendor: "OpenSource", detection_dir: ".clawdbot", binary_name: "clawdbot" },
-    AgentDefinition { agent_name: "moltbot", vendor: "OpenSource", detection_dir: ".moltbot", binary_name: "moltbot" },
-    AgentDefinition { agent_name: "moldbot", vendor: "OpenSource", detection_dir: ".moldbot", binary_name: "moldbot" },
-    AgentDefinition { agent_name: "gpt-engineer", vendor: "OpenSource", detection_dir: ".gpt-engineer", binary_name: "gpt-engineer" },
+const AGENT_DEFS: &[AgentDef] = &[
+    AgentDef { agent_name: "openclaw", vendor: "OpenSource", detection_dir: ".openclaw", binary_name: "openclaw" },
+    AgentDef { agent_name: "clawdbot", vendor: "OpenSource", detection_dir: ".clawdbot", binary_name: "clawdbot" },
+    AgentDef { agent_name: "moltbot", vendor: "OpenSource", detection_dir: ".moltbot", binary_name: "moltbot" },
+    AgentDef { agent_name: "moldbot", vendor: "OpenSource", detection_dir: ".moldbot", binary_name: "moldbot" },
+    AgentDef { agent_name: "gpt-engineer", vendor: "OpenSource", detection_dir: ".gpt-engineer", binary_name: "gpt-engineer" },
 ];
 
-pub fn detect_general_ai_agents(user_home: &str, verbose: bool) -> Vec<AiTool> {
+pub fn detect_general_ai_agents(verbose: bool) -> Vec<AiTool> {
     print_progress(verbose, "Detecting general-purpose AI agents...");
     let mut results = Vec::new();
 
-    for agent in AGENT_DEFINITIONS {
-        let detection_path = format!("{}/{}", user_home, agent.detection_dir);
+    let home = home_dir().unwrap_or_default();
+
+    for agent in AGENT_DEFS {
+        let detection_path = home.join(agent.detection_dir);
         let mut found = false;
         let mut install_path = String::new();
         let mut version = String::from("unknown");
 
-        // Check detection path
-        if Path::new(&detection_path).exists() {
+        if detection_path.exists() {
             found = true;
-            install_path = detection_path.clone();
+            install_path = detection_path.to_string_lossy().to_string();
         }
 
-        // Check binary in PATH
         if !found {
-            if let Some(path) = command_exists_for_user("", agent.binary_name) {
+            if let Some(bin_path) = which(agent.binary_name) {
                 found = true;
-                install_path = path;
+                install_path = bin_path.to_string_lossy().to_string();
             }
         }
 
         if found {
-            // Try to get version
-            if command_available(agent.binary_name) {
-                let ver = run_command(agent.binary_name, &["--version"], Some(10));
-                if !ver.is_empty() {
-                    version = ver.lines().next().unwrap_or("unknown").trim().to_string();
+            if let Some(bin_path) = which(agent.binary_name) {
+                let ver = get_version(&bin_path.to_string_lossy(), "--version");
+                if !ver.is_empty() && ver != "unknown" {
+                    version = ver;
                 }
             }
 
@@ -370,43 +315,24 @@ pub fn detect_general_ai_agents(user_home: &str, verbose: bool) -> Vec<AiTool> {
         }
     }
 
-    // Check for Claude Cowork (special case - mode within Claude Desktop)
-    let claude_desktop_path = "/Applications/Claude.app";
-    if Path::new(claude_desktop_path).is_dir() {
-        let plist_path = format!("{}/Contents/Info.plist", claude_desktop_path);
-        if Path::new(&plist_path).exists() {
-            let claude_version = run_command(
-                "/usr/libexec/PlistBuddy",
-                &["-c", "Print :CFBundleShortVersionString", &plist_path],
-                None,
-            );
-
-            if !claude_version.is_empty() {
-                // Check if version supports Cowork (v0.7.0+)
-                let supports_cowork = if let Some(first_char) = claude_version.chars().next() {
-                    if first_char == '0' {
-                        // Check 0.7+
-                        claude_version.starts_with("0.7")
-                            || claude_version.starts_with("0.8")
-                            || claude_version.starts_with("0.9")
-                    } else {
-                        first_char.is_ascii_digit() && first_char != '0'
-                    }
-                } else {
-                    false
-                };
+    // Claude Cowork (macOS-only: mode within Claude Desktop 0.7.0+)
+    #[cfg(target_os = "macos")]
+    {
+        let claude_desktop_path = "/Applications/Claude.app";
+        if Path::new(claude_desktop_path).is_dir() {
+            if let Some(ver) = read_plist_version(claude_desktop_path) {
+                let supports_cowork = ver.starts_with("0.7")
+                    || ver.starts_with("0.8")
+                    || ver.starts_with("0.9")
+                    || ver.chars().next().map(|c| c.is_ascii_digit() && c != '0').unwrap_or(false);
 
                 if supports_cowork {
-                    print_progress(
-                        verbose,
-                        &format!("  Found: claude-cowork (Anthropic) - mode within Claude Desktop v{}", claude_version),
-                    );
-
+                    print_progress(verbose, &format!("  Found: claude-cowork (Anthropic) v{}", ver));
                     results.push(AiTool {
                         name: "claude-cowork".to_string(),
                         vendor: "Anthropic".to_string(),
                         tool_type: "general_agent".to_string(),
-                        version: claude_version,
+                        version: ver,
                         binary_path: None,
                         config_dir: None,
                         install_path: Some(claude_desktop_path.to_string()),
@@ -428,61 +354,40 @@ pub fn detect_general_ai_agents(user_home: &str, verbose: bool) -> Vec<AiTool> {
 
 // ─── AI Frameworks Detection ────────────────────────────────────────────────
 
-struct FrameworkDefinition {
-    framework_name: &'static str,
-    binary_name: &'static str,
-    process_name: &'static str,
+struct FrameworkDef {
+    name: &'static str,
+    binary: &'static str,
+    process: &'static str,
 }
 
-const FRAMEWORK_DEFINITIONS: &[FrameworkDefinition] = &[
-    FrameworkDefinition { framework_name: "ollama", binary_name: "ollama", process_name: "ollama" },
-    FrameworkDefinition { framework_name: "localai", binary_name: "local-ai", process_name: "local-ai" },
-    FrameworkDefinition { framework_name: "lm-studio", binary_name: "lm-studio", process_name: "lm-studio" },
-    FrameworkDefinition { framework_name: "text-generation-webui", binary_name: "textgen", process_name: "textgen" },
+const FRAMEWORK_DEFS: &[FrameworkDef] = &[
+    FrameworkDef { name: "ollama", binary: "ollama", process: "ollama" },
+    FrameworkDef { name: "localai", binary: "local-ai", process: "local-ai" },
+    FrameworkDef { name: "lm-studio", binary: "lm-studio", process: "lm-studio" },
+    FrameworkDef { name: "text-generation-webui", binary: "textgen", process: "textgen" },
 ];
 
-pub fn detect_ai_frameworks(logged_in_user: &str, verbose: bool) -> Vec<AiTool> {
+pub fn detect_ai_frameworks(verbose: bool) -> Vec<AiTool> {
     print_progress(verbose, "Detecting AI frameworks and runtimes...");
     let mut results = Vec::new();
 
-    for framework in FRAMEWORK_DEFINITIONS {
-        let binary_path = run_as_user(
-            logged_in_user,
-            &format!("command -v {} 2>/dev/null", framework.binary_name),
-            10,
-        );
-
-        if !binary_path.is_empty() {
-            let version_output = run_as_user(
-                logged_in_user,
-                &format!("{} --version 2>/dev/null | head -1", framework.binary_name),
-                10,
-            );
-            let version = if version_output.is_empty() {
-                "unknown".to_string()
-            } else {
-                version_output.lines().next().unwrap_or("unknown").trim().to_string()
-            };
-
-            // Check if process is running
-            let is_running = run_command("pgrep", &["-x", framework.process_name], None)
-                .is_empty()
-                == false;
+    for fw in FRAMEWORK_DEFS {
+        if let Some(bin_path) = which(fw.binary) {
+            let bin_str = bin_path.to_string_lossy().to_string();
+            let version = get_version(&bin_str, "--version");
+            let is_running = is_process_running(fw.process);
 
             print_progress(
                 verbose,
-                &format!(
-                    "  Found: {} v{} at {} (running: {})",
-                    framework.framework_name, version, binary_path, is_running
-                ),
+                &format!("  Found: {} v{} at {} (running: {})", fw.name, version, bin_str, is_running),
             );
 
             results.push(AiTool {
-                name: framework.framework_name.to_string(),
+                name: fw.name.to_string(),
                 vendor: "Unknown".to_string(),
                 tool_type: "framework".to_string(),
                 version,
-                binary_path: Some(binary_path),
+                binary_path: Some(bin_str),
                 config_dir: None,
                 install_path: None,
                 is_running: Some(is_running),
@@ -490,38 +395,27 @@ pub fn detect_ai_frameworks(logged_in_user: &str, verbose: bool) -> Vec<AiTool> 
         }
     }
 
-    // Check for LM Studio as an application
-    let lm_studio_app = "/Applications/LM Studio.app";
-    if Path::new(lm_studio_app).is_dir() {
-        let plist_path = format!("{}/Contents/Info.plist", lm_studio_app);
-        let version = if Path::new(&plist_path).exists() {
-            let ver = run_command(
-                "/usr/libexec/PlistBuddy",
-                &["-c", "Print :CFBundleShortVersionString", &plist_path],
-                None,
-            );
-            if ver.is_empty() { "unknown".to_string() } else { ver }
-        } else {
-            "unknown".to_string()
-        };
+    // LM Studio as an application (macOS)
+    #[cfg(target_os = "macos")]
+    {
+        let lm_studio_app = "/Applications/LM Studio.app";
+        if Path::new(lm_studio_app).is_dir() {
+            let version = read_plist_version(lm_studio_app).unwrap_or_else(|| "unknown".to_string());
+            let is_running = is_process_running("LM Studio");
 
-        let is_running = !run_command("pgrep", &["-f", "LM Studio"], None).is_empty();
+            print_progress(verbose, &format!("  Found: lm-studio v{} (running: {})", version, is_running));
 
-        print_progress(
-            verbose,
-            &format!("  Found: lm-studio v{} at {} (running: {})", version, lm_studio_app, is_running),
-        );
-
-        results.push(AiTool {
-            name: "lm-studio".to_string(),
-            vendor: "LM Studio".to_string(),
-            tool_type: "framework".to_string(),
-            version,
-            binary_path: Some(lm_studio_app.to_string()),
-            config_dir: None,
-            install_path: None,
-            is_running: Some(is_running),
-        });
+            results.push(AiTool {
+                name: "lm-studio".to_string(),
+                vendor: "LM Studio".to_string(),
+                tool_type: "framework".to_string(),
+                version,
+                binary_path: Some(lm_studio_app.to_string()),
+                config_dir: None,
+                install_path: None,
+                is_running: Some(is_running),
+            });
+        }
     }
 
     if results.is_empty() {
@@ -535,80 +429,33 @@ pub fn detect_ai_frameworks(logged_in_user: &str, verbose: bool) -> Vec<AiTool> 
 
 // ─── MCP Config Collection ──────────────────────────────────────────────────
 
-struct McpConfigSource {
-    source_name: &'static str,
-    config_path: &'static str, // relative to home, or absolute
-    vendor: &'static str,
-}
-
-const MCP_CONFIG_SOURCES: &[McpConfigSource] = &[
-    McpConfigSource { source_name: "claude_desktop", config_path: "Library/Application Support/Claude/claude_desktop_config.json", vendor: "Anthropic" },
-    McpConfigSource { source_name: "claude_code", config_path: ".claude/settings.json", vendor: "Anthropic" },
-    McpConfigSource { source_name: "claude_code", config_path: ".claude.json", vendor: "Anthropic" },
-    McpConfigSource { source_name: "cursor", config_path: ".cursor/mcp.json", vendor: "Cursor" },
-    McpConfigSource { source_name: "windsurf", config_path: ".codeium/windsurf/mcp_config.json", vendor: "Codeium" },
-    McpConfigSource { source_name: "antigravity", config_path: ".gemini/antigravity/mcp_config.json", vendor: "Google" },
-    McpConfigSource { source_name: "zed", config_path: ".config/zed/settings.json", vendor: "Zed" },
-    McpConfigSource { source_name: "open_interpreter", config_path: ".config/open-interpreter/config.yaml", vendor: "OpenSource" },
-    McpConfigSource { source_name: "codex", config_path: ".codex/config.toml", vendor: "OpenAI" },
-];
-
-pub fn collect_mcp_configs(user_home: &str, is_enterprise: bool, jq_available: bool, perl_available: bool, verbose: bool) -> Vec<McpConfig> {
+pub fn collect_mcp_configs(is_enterprise: bool, verbose: bool) -> Vec<McpConfig> {
     print_progress(verbose, "Collecting MCP configuration files...");
     let mut results = Vec::new();
 
-    let jq_filter = r#"
-      def extract: map_values(
-        {command, args, serverUrl, url}
-        | with_entries(select(.value != null))
-      );
-      if .mcpServers then {mcpServers: (.mcpServers | extract)}
-      elif .context_servers then {context_servers: (.context_servers | extract)}
-      elif .projects then {mcpServers: ([.projects[].mcpServers // {} | to_entries[]] | from_entries | extract)}
-      else {} end
-    "#;
+    let home = match home_dir() {
+        Some(h) => h,
+        None => return results,
+    };
 
-    for source in MCP_CONFIG_SOURCES {
-        let config_path = format!("{}/{}", user_home, source.config_path);
-        let path = Path::new(&config_path);
+    for source in mcp_config_definitions() {
+        let config_path = home.join(source.config_path);
 
-        if !path.is_file() {
+        if !config_path.is_file() {
             continue;
         }
 
         let content = match fs::read_to_string(&config_path) {
             Ok(c) if !c.is_empty() => c,
             _ => {
-                print_progress(verbose, &format!("  Skipping {}: empty or unreadable config", source.source_name));
+                print_progress(verbose, &format!("  Skipping {}: empty or unreadable", source.source_name));
                 continue;
             }
         };
 
-        // For JSON configs, filter with jq if available
-        let filtered_content = if jq_available && config_path.ends_with(".json") {
-            let mut json_input = content.clone();
-
-            // Strip JSONC comments for Zed
-            if source.source_name == "zed" && perl_available {
-                let (stripped, _, _) = run_shell(
-                    &format!("echo {} | perl -0777 -pe 's{{/\\*.*?\\*/}}{{}}gs; s{{//[^\\n]*}}{{}}g'",
-                        shell_escape(&json_input)),
-                    10,
-                );
-                if !stripped.is_empty() {
-                    json_input = stripped;
-                }
-            }
-
-            let (filtered, _, code) = run_shell(
-                &format!("echo {} | jq -c {}", shell_escape(&json_input), shell_escape(jq_filter)),
-                10,
-            );
-            if code == 0 && !filtered.is_empty() {
-                filtered
-            } else {
-                content.clone()
-            }
+        // For JSON configs, filter to extract only MCP server info (no secrets)
+        let filtered = if config_path.to_string_lossy().ends_with(".json") {
+            filter_mcp_json(&content, source.source_name)
         } else {
             content.clone()
         };
@@ -618,7 +465,7 @@ pub fn collect_mcp_configs(user_home: &str, is_enterprise: bool, jq_available: b
         let config_content_base64 = if is_enterprise {
             Some(base64::Engine::encode(
                 &base64::engine::general_purpose::STANDARD,
-                filtered_content.as_bytes(),
+                filtered.as_bytes(),
             ))
         } else {
             None
@@ -626,7 +473,7 @@ pub fn collect_mcp_configs(user_home: &str, is_enterprise: bool, jq_available: b
 
         results.push(McpConfig {
             config_source: source.source_name.to_string(),
-            config_path: config_path.to_string(),
+            config_path: config_path.to_string_lossy().to_string(),
             vendor: source.vendor.to_string(),
             config_content_base64,
         });
@@ -641,30 +488,125 @@ pub fn collect_mcp_configs(user_home: &str, is_enterprise: bool, jq_available: b
     results
 }
 
-/// Simple shell escaping for use in sh -c commands
-fn shell_escape(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
+/// Filter MCP JSON to extract only server names, commands, and URLs (no secrets).
+fn filter_mcp_json(content: &str, source_name: &str) -> String {
+    // Strip JSONC comments for Zed configs
+    let cleaned = if source_name == "zed" {
+        strip_jsonc_comments(content)
+    } else {
+        content.to_string()
+    };
+
+    let parsed: Result<serde_json::Value, _> = serde_json::from_str(&cleaned);
+    let value = match parsed {
+        Ok(v) => v,
+        Err(_) => return content.to_string(), // Can't parse, return raw
+    };
+
+    // Extract mcpServers or context_servers
+    let servers = value.get("mcpServers")
+        .or_else(|| value.get("context_servers"));
+
+    if let Some(servers) = servers {
+        if let Some(obj) = servers.as_object() {
+            let filtered: serde_json::Map<String, serde_json::Value> = obj
+                .iter()
+                .map(|(k, v)| {
+                    let mut entry = serde_json::Map::new();
+                    if let Some(cmd) = v.get("command") {
+                        entry.insert("command".to_string(), cmd.clone());
+                    }
+                    if let Some(args) = v.get("args") {
+                        entry.insert("args".to_string(), args.clone());
+                    }
+                    if let Some(url) = v.get("serverUrl").or_else(|| v.get("url")) {
+                        entry.insert("url".to_string(), url.clone());
+                    }
+                    (k.clone(), serde_json::Value::Object(entry))
+                })
+                .collect();
+            let mut result = serde_json::Map::new();
+            result.insert("mcpServers".to_string(), serde_json::Value::Object(filtered));
+            return serde_json::to_string(&serde_json::Value::Object(result)).unwrap_or_default();
+        }
+    }
+
+    content.to_string()
+}
+
+/// Strip // and /* */ comments from JSONC.
+fn strip_jsonc_comments(input: &str) -> String {
+    let mut result = String::with_capacity(input.len());
+    let chars: Vec<char> = input.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+    let mut in_string = false;
+
+    while i < len {
+        if in_string {
+            result.push(chars[i]);
+            if chars[i] == '\\' && i + 1 < len {
+                i += 1;
+                result.push(chars[i]);
+            } else if chars[i] == '"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        if chars[i] == '"' {
+            in_string = true;
+            result.push(chars[i]);
+            i += 1;
+            continue;
+        }
+
+        if chars[i] == '/' && i + 1 < len {
+            if chars[i + 1] == '/' {
+                // Line comment - skip to end of line
+                i += 2;
+                while i < len && chars[i] != '\n' {
+                    i += 1;
+                }
+                continue;
+            } else if chars[i + 1] == '*' {
+                // Block comment - skip to */
+                i += 2;
+                while i + 1 < len && !(chars[i] == '*' && chars[i + 1] == '/') {
+                    i += 1;
+                }
+                i += 2; // skip */
+                continue;
+            }
+        }
+
+        result.push(chars[i]);
+        i += 1;
+    }
+
+    result
 }
 
 // ─── IDE Extension Collection ───────────────────────────────────────────────
 
-pub fn collect_ide_extensions(user_home: &str, verbose: bool) -> Vec<IdeExtension> {
+pub fn collect_ide_extensions(verbose: bool) -> Vec<IdeExtension> {
     print_progress(verbose, "Scanning IDE extensions...");
     let mut all_extensions = Vec::new();
 
-    // VSCode extensions
-    let vscode_dir = format!("{}/.vscode/extensions", user_home);
-    if Path::new(&vscode_dir).is_dir() {
-        let exts = scan_extension_dir(&vscode_dir, "vscode", verbose);
-        print_progress(verbose, &format!("  Found {} VSCode extensions", exts.len()));
-        all_extensions.extend(exts);
-    }
+    let home = match home_dir() {
+        Some(h) => h,
+        None => return all_extensions,
+    };
 
-    // Cursor extensions
-    let cursor_dir = format!("{}/.cursor/extensions", user_home);
-    if Path::new(&cursor_dir).is_dir() {
-        let exts = scan_extension_dir(&cursor_dir, "openvsx", verbose);
-        print_progress(verbose, &format!("  Found {} Cursor extensions", exts.len()));
+    for ext_dir_def in extension_directories() {
+        let ext_dir = home.join(ext_dir_def.dir_suffix);
+        if !ext_dir.is_dir() {
+            continue;
+        }
+
+        let exts = scan_extension_dir(&ext_dir.to_string_lossy(), ext_dir_def.ide_type);
+        print_progress(verbose, &format!("  Found {} {} extensions", exts.len(), ext_dir_def.ide_name));
         all_extensions.extend(exts);
     }
 
@@ -677,10 +619,9 @@ pub fn collect_ide_extensions(user_home: &str, verbose: bool) -> Vec<IdeExtensio
     all_extensions
 }
 
-fn scan_extension_dir(ext_dir: &str, ide_type: &str, _verbose: bool) -> Vec<IdeExtension> {
+fn scan_extension_dir(ext_dir: &str, ide_type: &str) -> Vec<IdeExtension> {
     let mut extensions = Vec::new();
 
-    // Load obsolete extensions
     let obsolete_path = format!("{}/.obsolete", ext_dir);
     let obsolete_content = fs::read_to_string(&obsolete_path).unwrap_or_else(|_| "{}".to_string());
 
@@ -700,36 +641,31 @@ fn scan_extension_dir(ext_dir: &str, ide_type: &str, _verbose: bool) -> Vec<IdeE
             Err(_) => continue,
         };
 
-        // Skip special entries
         if dirname == "extensions.json" || dirname == ".obsolete" {
             continue;
         }
 
-        // Check if obsolete
         if obsolete_content.contains(&format!("\"{}\":true", dirname)) {
             continue;
         }
 
-        // Parse: publisher.name-version or publisher.name-version-platform
+        // Parse: publisher.name-version[-platform]
         let (publisher, rest) = match dirname.split_once('.') {
             Some((p, r)) => (p.to_string(), r.to_string()),
             None => continue,
         };
 
         // Remove platform suffix
-        let rest = rest
-            .strip_suffix("-universal")
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| {
-                // Strip -darwin-* suffix
-                if let Some(idx) = rest.find("-darwin-") {
-                    rest[..idx].to_string()
-                } else {
-                    rest.clone()
-                }
-            });
+        let rest = if let Some(idx) = rest.find("-darwin-") {
+            rest[..idx].to_string()
+        } else if let Some(idx) = rest.find("-linux-") {
+            rest[..idx].to_string()
+        } else if let Some(idx) = rest.find("-win32-") {
+            rest[..idx].to_string()
+        } else {
+            rest.strip_suffix("-universal").unwrap_or(&rest).to_string()
+        };
 
-        // Split name-version (version is after last hyphen)
         let (name, version) = match rest.rfind('-') {
             Some(idx) => (rest[..idx].to_string(), rest[idx + 1..].to_string()),
             None => continue,
@@ -739,7 +675,6 @@ fn scan_extension_dir(ext_dir: &str, ide_type: &str, _verbose: bool) -> Vec<IdeE
             continue;
         }
 
-        // Get install date from directory mtime
         let install_date = entry
             .metadata()
             .ok()

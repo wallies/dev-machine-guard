@@ -5,6 +5,7 @@ use std::process::Command;
 
 use crate::detect::*;
 use crate::node_scan::*;
+use crate::platform::*;
 use crate::types::*;
 use crate::util::*;
 
@@ -17,15 +18,23 @@ pub fn is_enterprise_mode(config: &Config) -> bool {
 // ─── Instance Locking ───────────────────────────────────────────────────────
 
 fn get_lock_file_path() -> String {
-    let is_root = unsafe { libc::getuid() } == 0;
-    if is_root {
-        "/var/run/stepsecurity-agent.lock".to_string()
-    } else {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        let lock_dir = format!("{}/.stepsecurity", home);
-        let _ = fs::create_dir_all(&lock_dir);
-        format!("{}/agent.lock", lock_dir)
+    #[cfg(unix)]
+    {
+        let is_root = unsafe { libc::getuid() } == 0;
+        if is_root {
+            return "/var/run/stepsecurity-agent.lock".to_string();
+        }
     }
+
+    let home = home_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| {
+            if cfg!(windows) { std::env::var("TEMP").unwrap_or_else(|_| "C:\\Temp".to_string()) }
+            else { "/tmp".to_string() }
+        });
+    let lock_dir = format!("{}/.stepsecurity", home);
+    let _ = fs::create_dir_all(&lock_dir);
+    format!("{}/agent.lock", lock_dir)
 }
 
 pub fn acquire_lock() -> Result<(), String> {
@@ -36,16 +45,12 @@ pub fn acquire_lock() -> Result<(), String> {
         if let Ok(contents) = fs::read_to_string(&lock_file) {
             if let Ok(existing_pid) = contents.trim().parse::<u32>() {
                 // Check if process is still running
-                let status = Command::new("kill")
-                    .args(["-0", &existing_pid.to_string()])
-                    .output();
-                if let Ok(output) = status {
-                    if output.status.success() {
-                        return Err(format!(
-                            "Another instance is already running (PID: {})",
-                            existing_pid
-                        ));
-                    }
+                let still_running = is_pid_running(existing_pid);
+                if still_running {
+                    return Err(format!(
+                        "Another instance is already running (PID: {})",
+                        existing_pid
+                    ));
                 }
                 // Stale lock, remove it
                 let _ = fs::remove_file(&lock_file);
@@ -61,6 +66,29 @@ pub fn acquire_lock() -> Result<(), String> {
     Ok(())
 }
 
+fn is_pid_running(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        let status = Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .output();
+        if let Ok(output) = status {
+            return output.status.success();
+        }
+        false
+    }
+    #[cfg(windows)]
+    {
+        let output = run_cmd("tasklist", &["/FI", &format!("PID eq {}", pid), "/NH"]);
+        output.contains(&pid.to_string())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
 pub fn release_lock() {
     let lock_file = get_lock_file_path();
     let my_pid = std::process::id();
@@ -74,9 +102,39 @@ pub fn release_lock() {
     }
 }
 
-// ─── LaunchD Management ─────────────────────────────────────────────────────
+// ─── Scheduling Management ─────────────────────────────────────────────────
 
-pub fn configure_launchd(config: &Config) -> Result<(), String> {
+pub fn configure_scheduling(config: &Config) -> Result<(), String> {
+    match current_platform() {
+        Platform::MacOS => configure_launchd(config),
+        Platform::Linux => configure_systemd(config),
+        Platform::Windows => configure_task_scheduler(config),
+        Platform::Unknown => Err("Unsupported platform for scheduling".to_string()),
+    }
+}
+
+pub fn uninstall_scheduling() {
+    match current_platform() {
+        Platform::MacOS => uninstall_launchd(),
+        Platform::Linux => uninstall_systemd(),
+        Platform::Windows => uninstall_task_scheduler(),
+        Platform::Unknown => eprintln!("Unsupported platform for scheduling"),
+    }
+}
+
+pub fn is_scheduling_configured() -> bool {
+    match current_platform() {
+        Platform::MacOS => is_launchd_configured(),
+        Platform::Linux => is_systemd_configured(),
+        Platform::Windows => is_task_scheduler_configured(),
+        Platform::Unknown => false,
+    }
+}
+
+// ─── macOS LaunchD ──────────────────────────────────────────────────────────
+
+#[cfg(target_os = "macos")]
+fn configure_launchd(config: &Config) -> Result<(), String> {
     let exe_path = std::env::current_exe()
         .map(|p| p.to_string_lossy().to_string())
         .map_err(|e| format!("Failed to get executable path: {}", e))?;
@@ -142,7 +200,6 @@ pub fn configure_launchd(config: &Config) -> Result<(), String> {
     fs::write(&plist_path, plist_content)
         .map_err(|e| format!("Failed to write plist: {}", e))?;
 
-    // Load the plist
     let status = Command::new("launchctl")
         .args(["load", &plist_path])
         .output();
@@ -158,7 +215,13 @@ pub fn configure_launchd(config: &Config) -> Result<(), String> {
     }
 }
 
-pub fn uninstall_launchd() {
+#[cfg(not(target_os = "macos"))]
+fn configure_launchd(_config: &Config) -> Result<(), String> {
+    Err("launchd is only available on macOS".to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn uninstall_launchd() {
     let is_root = unsafe { libc::getuid() } == 0;
     let plist_path = if is_root {
         eprintln!("Removing LaunchDaemon configuration...");
@@ -169,8 +232,7 @@ pub fn uninstall_launchd() {
         format!("{}/Library/LaunchAgents/com.stepsecurity.agent.plist", home)
     };
 
-    // Check if loaded
-    let list_output = run_command("launchctl", &["list"], None);
+    let list_output = run_cmd("launchctl", &["list"]);
     if list_output.contains("com.stepsecurity.agent") {
         let _ = Command::new("launchctl")
             .args(["unload", &plist_path])
@@ -188,98 +250,284 @@ pub fn uninstall_launchd() {
     eprintln!("launchd configuration removed successfully");
 }
 
-pub fn is_launchd_configured() -> bool {
-    let list_output = run_command("launchctl", &["list"], None);
+#[cfg(not(target_os = "macos"))]
+fn uninstall_launchd() {}
+
+#[cfg(target_os = "macos")]
+fn is_launchd_configured() -> bool {
+    let list_output = run_cmd("launchctl", &["list"]);
     list_output.contains("com.stepsecurity.agent")
 }
 
-// ─── Telemetry Upload ───────────────────────────────────────────────────────
+#[cfg(not(target_os = "macos"))]
+fn is_launchd_configured() -> bool {
+    false
+}
 
-fn upload_telemetry_to_s3(
+// ─── Linux systemd ─────────────────────────────────────────────────────────
+
+#[cfg(target_os = "linux")]
+fn configure_systemd(config: &Config) -> Result<(), String> {
+    let exe_path = std::env::current_exe()
+        .map(|p| p.to_string_lossy().to_string())
+        .map_err(|e| format!("Failed to get executable path: {}", e))?;
+
+    let scan_freq: u64 = config
+        .scan_frequency_hours
+        .parse::<u64>()
+        .unwrap_or(6);
+
+    eprintln!("Configuring systemd for periodic execution...");
+    eprintln!("  Binary: {}", exe_path);
+    eprintln!("  Interval: Every {} hours", scan_freq);
+
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let systemd_dir = format!("{}/.config/systemd/user", home);
+    let _ = fs::create_dir_all(&systemd_dir);
+
+    let service_content = format!(
+        r#"[Unit]
+Description=StepSecurity Dev Machine Guard Agent
+
+[Service]
+Type=oneshot
+ExecStart={} send-telemetry
+"#,
+        exe_path
+    );
+
+    let timer_content = format!(
+        r#"[Unit]
+Description=StepSecurity Dev Machine Guard Timer
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec={}h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+"#,
+        scan_freq
+    );
+
+    let service_path = format!("{}/stepsecurity-agent.service", systemd_dir);
+    let timer_path = format!("{}/stepsecurity-agent.timer", systemd_dir);
+
+    fs::write(&service_path, service_content)
+        .map_err(|e| format!("Failed to write service file: {}", e))?;
+    fs::write(&timer_path, timer_content)
+        .map_err(|e| format!("Failed to write timer file: {}", e))?;
+
+    let _ = Command::new("systemctl")
+        .args(["--user", "daemon-reload"])
+        .output();
+
+    let status = Command::new("systemctl")
+        .args(["--user", "enable", "--now", "stepsecurity-agent.timer"])
+        .output();
+
+    match status {
+        Ok(output) if output.status.success() => {
+            eprintln!("systemd configuration completed successfully");
+            Ok(())
+        }
+        _ => Err("Failed to enable systemd timer".to_string()),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn configure_systemd(_config: &Config) -> Result<(), String> {
+    Err("systemd is only available on Linux".to_string())
+}
+
+#[cfg(target_os = "linux")]
+fn uninstall_systemd() {
+    eprintln!("Removing systemd configuration...");
+    let _ = Command::new("systemctl")
+        .args(["--user", "disable", "--now", "stepsecurity-agent.timer"])
+        .output();
+
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let systemd_dir = format!("{}/.config/systemd/user", home);
+
+    for file in &["stepsecurity-agent.service", "stepsecurity-agent.timer"] {
+        let path = format!("{}/{}", systemd_dir, file);
+        if Path::new(&path).exists() {
+            let _ = fs::remove_file(&path);
+            eprintln!("Removed: {}", path);
+        }
+    }
+
+    let _ = Command::new("systemctl")
+        .args(["--user", "daemon-reload"])
+        .output();
+
+    eprintln!("systemd configuration removed successfully");
+}
+
+#[cfg(not(target_os = "linux"))]
+fn uninstall_systemd() {}
+
+#[cfg(target_os = "linux")]
+fn is_systemd_configured() -> bool {
+    let output = run_cmd("systemctl", &["--user", "is-enabled", "stepsecurity-agent.timer"]);
+    output.trim() == "enabled"
+}
+
+#[cfg(not(target_os = "linux"))]
+fn is_systemd_configured() -> bool {
+    false
+}
+
+// ─── Windows Task Scheduler ────────────────────────────────────────────────
+
+#[cfg(target_os = "windows")]
+fn configure_task_scheduler(config: &Config) -> Result<(), String> {
+    let exe_path = std::env::current_exe()
+        .map(|p| p.to_string_lossy().to_string())
+        .map_err(|e| format!("Failed to get executable path: {}", e))?;
+
+    let scan_freq: u64 = config
+        .scan_frequency_hours
+        .parse::<u64>()
+        .unwrap_or(6);
+
+    eprintln!("Configuring Windows Task Scheduler...");
+    eprintln!("  Binary: {}", exe_path);
+    eprintln!("  Interval: Every {} hours", scan_freq);
+
+    let interval_minutes = scan_freq * 60;
+    let status = Command::new("schtasks")
+        .args([
+            "/Create", "/F",
+            "/SC", "MINUTE",
+            "/MO", &interval_minutes.to_string(),
+            "/TN", "StepSecurity\\DevMachineGuard",
+            "/TR", &format!("\"{}\" send-telemetry", exe_path),
+            "/RL", "LIMITED",
+        ])
+        .output();
+
+    match status {
+        Ok(output) if output.status.success() => {
+            eprintln!("Task Scheduler configuration completed successfully");
+            Ok(())
+        }
+        _ => Err("Failed to create scheduled task".to_string()),
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn configure_task_scheduler(_config: &Config) -> Result<(), String> {
+    Err("Task Scheduler is only available on Windows".to_string())
+}
+
+#[cfg(target_os = "windows")]
+fn uninstall_task_scheduler() {
+    eprintln!("Removing Windows Task Scheduler configuration...");
+    let status = Command::new("schtasks")
+        .args(["/Delete", "/F", "/TN", "StepSecurity\\DevMachineGuard"])
+        .output();
+    match status {
+        Ok(output) if output.status.success() => {
+            eprintln!("Task removed successfully");
+        }
+        _ => eprintln!("Failed to remove scheduled task (may not exist)"),
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn uninstall_task_scheduler() {}
+
+#[cfg(target_os = "windows")]
+fn is_task_scheduler_configured() -> bool {
+    let output = run_cmd("schtasks", &["/Query", "/TN", "StepSecurity\\DevMachineGuard"]);
+    !output.is_empty()
+}
+
+#[cfg(not(target_os = "windows"))]
+fn is_task_scheduler_configured() -> bool {
+    false
+}
+
+// ─── Telemetry Upload (using ureq) ──────────────────────────────────────────
+
+fn upload_telemetry(
     device_id: &str,
-    payload_file: &str,
+    payload_json: &str,
     config: &Config,
 ) -> Result<(), String> {
     eprintln!("Requesting upload URL from backend...");
 
-    let (response, _, code) = run_shell(
-        &format!(
-            r#"curl -s -X POST \
-                -H "Content-Type: application/json" \
-                -H "Authorization: Bearer {}" \
-                -H "X-Agent-Version: {}" \
-                -d '{{"device_id":"{}"}}' \
-                "{}/v1/{}/developer-mdm-agent/telemetry/upload-url""#,
-            config.api_key, AGENT_VERSION, device_id, config.api_endpoint, config.customer_id
-        ),
-        30,
+    let upload_url_endpoint = format!(
+        "{}/v1/{}/developer-mdm-agent/telemetry/upload-url",
+        config.api_endpoint, config.customer_id
     );
 
-    if code != 0 {
-        return Err("Failed to request upload URL".to_string());
-    }
+    let request_body = serde_json::json!({ "device_id": device_id });
 
-    // Extract upload_url and s3_key
-    let upload_url = extract_json_string(&response, "upload_url")
-        .ok_or("Failed to parse upload URL")?
-        .replace("\\u0026", "&")
-        .replace("\\u003d", "=")
-        .replace("\\u002f", "/")
-        .replace("\\/", "/");
+    let response = ureq::post(&upload_url_endpoint)
+        .set("Content-Type", "application/json")
+        .set("Authorization", &format!("Bearer {}", config.api_key))
+        .set("X-Agent-Version", AGENT_VERSION)
+        .send_json(&request_body)
+        .map_err(|e| format!("Failed to request upload URL: {}", e))?;
 
-    let s3_key = extract_json_string(&response, "s3_key")
-        .ok_or("Failed to parse s3_key")?;
+    let response_json: serde_json::Value = response
+        .into_json()
+        .map_err(|e| format!("Failed to parse upload URL response: {}", e))?;
+
+    let upload_url = response_json
+        .get("upload_url")
+        .and_then(|v| v.as_str())
+        .ok_or("Missing upload_url in response")?
+        .to_string();
+
+    let s3_key = response_json
+        .get("s3_key")
+        .and_then(|v| v.as_str())
+        .ok_or("Missing s3_key in response")?
+        .to_string();
 
     eprintln!("Uploading telemetry to S3...");
 
-    let (upload_response, _, _) = run_shell(
-        &format!(
-            r#"curl -w "\n%{{http_code}}" -X PUT \
-                -H "Content-Type: application/json" \
-                --upload-file {} \
-                "{}""#,
-            payload_file, upload_url
-        ),
-        60,
-    );
+    let upload_response = ureq::put(&upload_url)
+        .set("Content-Type", "application/json")
+        .send_string(payload_json)
+        .map_err(|e| format!("Failed to upload to S3: {}", e))?;
 
-    let http_code = upload_response.lines().last().unwrap_or("0");
-    if http_code != "200" {
-        return Err(format!("Failed to upload to S3 (HTTP {})", http_code));
+    if upload_response.status() != 200 {
+        return Err(format!("Failed to upload to S3 (HTTP {})", upload_response.status()));
     }
 
     eprintln!("Uploaded to S3");
     eprintln!("Notifying backend of upload...");
 
-    let (notify_response, _, _) = run_shell(
-        &format!(
-            r#"curl -w "\n%{{http_code}}" -s -X POST \
-                -H "Content-Type: application/json" \
-                -H "Authorization: Bearer {}" \
-                -H "X-Agent-Version: {}" \
-                -d '{{"s3_key":"{}","device_id":"{}"}}' \
-                "{}/v1/{}/developer-mdm-agent/telemetry/process-uploaded""#,
-            config.api_key, AGENT_VERSION, s3_key, device_id,
-            config.api_endpoint, config.customer_id
-        ),
-        30,
+    let process_endpoint = format!(
+        "{}/v1/{}/developer-mdm-agent/telemetry/process-uploaded",
+        config.api_endpoint, config.customer_id
     );
 
-    let notify_code = notify_response.lines().last().unwrap_or("0");
-    if notify_code == "200" || notify_code == "201" {
-        eprintln!("Backend processing initiated (HTTP {})", notify_code);
+    let notify_body = serde_json::json!({
+        "s3_key": s3_key,
+        "device_id": device_id,
+    });
+
+    let notify_response = ureq::post(&process_endpoint)
+        .set("Content-Type", "application/json")
+        .set("Authorization", &format!("Bearer {}", config.api_key))
+        .set("X-Agent-Version", AGENT_VERSION)
+        .send_json(&notify_body)
+        .map_err(|e| format!("Failed to notify backend: {}", e))?;
+
+    let status = notify_response.status();
+    if status == 200 || status == 201 {
+        eprintln!("Backend processing initiated (HTTP {})", status);
         Ok(())
     } else {
-        Err(format!("Failed to notify backend (HTTP {})", notify_code))
+        Err(format!("Failed to notify backend (HTTP {})", status))
     }
-}
-
-fn extract_json_string(json: &str, key: &str) -> Option<String> {
-    let pattern = format!("\"{}\":\"", key);
-    let start = json.find(&pattern)? + pattern.len();
-    let rest = &json[start..];
-    let end = rest.find('"')?;
-    Some(rest[..end].to_string())
 }
 
 // ─── Run Telemetry (Enterprise Mode) ────────────────────────────────────────
@@ -296,32 +544,9 @@ pub fn run_telemetry(config: &Config) {
         std::process::exit(1);
     }
 
-    // Verify macOS
-    let uname = run_command("uname", &["-s"], None);
-    if uname != "Darwin" {
-        print_error("This agent is for macOS only");
-        release_lock();
-        std::process::exit(1);
-    }
-
-    let jq_available = command_available("jq");
-    let perl_available = command_available("perl");
-    let curl_available = command_available("curl");
-
-    eprintln!(
-        "Tool availability: curl={}, jq={}, perl={}",
-        curl_available, jq_available, perl_available
-    );
-
-    if !curl_available {
-        print_error("curl not found (should be pre-installed on macOS)");
-        release_lock();
-        std::process::exit(1);
-    }
-
     // Validate config
     if config.customer_id.contains("{{") || config.api_key.contains("{{") || config.api_endpoint.contains("{{") {
-        print_error("This script needs to be customized with your customer details");
+        print_error("This binary needs to be customized with your customer details");
         release_lock();
         std::process::exit(1);
     }
@@ -330,14 +555,18 @@ pub fn run_telemetry(config: &Config) {
     let serial_number = get_serial_number();
     let os_version = get_os_version();
     let device_id = serial_number.clone();
-    let hostname = run_command("hostname", &[], None);
+    let hostname = get_hostname();
+    let platform = platform_string().to_string();
 
-    // Get logged-in user
-    let (logged_in_user, user_home) = get_logged_in_user_info();
+    // Get current user info
+    let username = current_username();
+    let user_home = home_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
 
     let collected_at = timestamp_secs();
 
-    if logged_in_user.is_empty() || user_home.is_empty() {
+    if username.is_empty() || user_home.is_empty() {
         eprintln!("No user currently logged in - skipping data collection");
 
         let payload = TelemetryPayload {
@@ -346,7 +575,7 @@ pub fn run_telemetry(config: &Config) {
             serial_number: serial_number.clone(),
             user_identity: "none".to_string(),
             hostname,
-            platform: "darwin".to_string(),
+            platform,
             os_version,
             agent_version: AGENT_VERSION.to_string(),
             collected_at,
@@ -375,12 +604,9 @@ pub fn run_telemetry(config: &Config) {
         };
 
         let payload_json = serde_json::to_string_pretty(&payload).unwrap_or_default();
-        let tmp_file = "/tmp/stepsec-payload.json";
-        let _ = fs::write(tmp_file, &payload_json);
 
-        match upload_telemetry_to_s3(&device_id, tmp_file, config) {
+        match upload_telemetry(&device_id, &payload_json, config) {
             Ok(()) => {
-                let _ = fs::remove_file(tmp_file);
                 eprintln!("Telemetry sent successfully (no user logged in)");
                 release_lock();
                 std::process::exit(0);
@@ -393,33 +619,27 @@ pub fn run_telemetry(config: &Config) {
         }
     }
 
-    let developer_identity = get_developer_identity(&logged_in_user);
+    let developer_identity = get_developer_identity(&username);
 
     eprintln!("Device ID (Serial): {}", device_id);
     eprintln!("OS Version: {}", os_version);
     eprintln!("Developer: {}", developer_identity);
-    eprintln!("Running commands as user: {}", logged_in_user);
     println!();
 
     // Run detections
-    let ide_installations = detect_ide_installations(&logged_in_user, true);
-    let ai_cli_tools = detect_ai_cli_tools(&logged_in_user, &user_home, true);
-    let general_ai_agents = detect_general_ai_agents(&user_home, true);
-    let ai_frameworks = detect_ai_frameworks(&logged_in_user, true);
+    let ide_installations = detect_ide_installations(true);
+    let ai_cli_tools = detect_ai_cli_tools(true);
+    let general_ai_agents = detect_general_ai_agents(true);
+    let ai_frameworks = detect_ai_frameworks(true);
 
     let mut ai_agents = Vec::new();
     ai_agents.extend(ai_cli_tools);
     ai_agents.extend(general_ai_agents);
     ai_agents.extend(ai_frameworks);
 
-    let mcp_configs = if jq_available && perl_available {
-        collect_mcp_configs(&user_home, true, jq_available, perl_available, true)
-    } else {
-        print_error(&format!("Skipping MCP config collection (jq={}, perl={})", jq_available, perl_available));
-        vec![]
-    };
+    let mcp_configs = collect_mcp_configs(true, true);
 
-    let ide_extensions = collect_ide_extensions(&user_home, true);
+    let ide_extensions = collect_ide_extensions(true);
 
     // Node.js scanning
     let enable_npm = config.enable_npm_scan != NpmScanMode::Disabled;
@@ -427,13 +647,12 @@ pub fn run_telemetry(config: &Config) {
     let mut node_global_scans = vec![];
     let mut node_project_scans = vec![];
     let mut node_projects_count = 0;
-    let node_scan_duration = 0u64;
 
     if enable_npm {
         eprintln!("Node.js package scanning is ENABLED");
-        node_package_managers = detect_package_managers(&logged_in_user, true);
-        node_global_scans = scan_global_packages(&logged_in_user, true);
-        let (scans, count) = scan_node_projects(&user_home, &logged_in_user, true);
+        node_package_managers = detect_package_managers(true);
+        node_global_scans = scan_global_packages(true);
+        let (scans, count) = scan_node_projects(&user_home, true);
         node_project_scans = scans;
         node_projects_count = count;
     } else {
@@ -446,16 +665,12 @@ pub fn run_telemetry(config: &Config) {
         serial_number: serial_number.clone(),
         user_identity: developer_identity,
         hostname,
-        platform: "darwin".to_string(),
+        platform,
         os_version,
         agent_version: AGENT_VERSION.to_string(),
         collected_at,
         no_user_logged_in: false,
-        available_tools: Some(AvailableTools {
-            jq: jq_available,
-            perl: perl_available,
-            curl: curl_available,
-        }),
+        available_tools: None,
         ide_extensions: ide_extensions.clone(),
         ide_installations,
         node_package_managers,
@@ -472,19 +687,16 @@ pub fn run_telemetry(config: &Config) {
         },
         performance_metrics: PerformanceMetrics {
             extensions_count: ide_extensions.len(),
-            node_packages_scan_ms: node_scan_duration,
+            node_packages_scan_ms: 0,
             node_global_packages_count: 0,
             node_projects_count,
         },
     };
 
     let payload_json = serde_json::to_string_pretty(&payload).unwrap_or_default();
-    let tmp_file = "/tmp/stepsec-payload.json";
-    let _ = fs::write(tmp_file, &payload_json);
 
-    match upload_telemetry_to_s3(&device_id, tmp_file, config) {
+    match upload_telemetry(&device_id, &payload_json, config) {
         Ok(()) => {
-            let _ = fs::remove_file(tmp_file);
             println!();
             eprintln!("Telemetry collection completed successfully");
             release_lock();
@@ -497,77 +709,4 @@ pub fn run_telemetry(config: &Config) {
             std::process::exit(1);
         }
     }
-}
-
-// ─── Device Info Helpers ────────────────────────────────────────────────────
-
-pub fn get_serial_number() -> String {
-    let serial = run_command(
-        "sh",
-        &["-c", "ioreg -l | grep IOPlatformSerialNumber | awk '{print $4}' | tr -d '\"'"],
-        None,
-    );
-    if serial.is_empty() {
-        let fallback = run_command(
-            "sh",
-            &["-c", "system_profiler SPHardwareDataType | awk '/Serial/ {print $4}'"],
-            None,
-        );
-        if fallback.is_empty() {
-            "unknown".to_string()
-        } else {
-            fallback
-        }
-    } else {
-        serial
-    }
-}
-
-pub fn get_os_version() -> String {
-    let ver = run_command("sw_vers", &["-productVersion"], None);
-    if ver.is_empty() {
-        "unknown".to_string()
-    } else {
-        ver
-    }
-}
-
-pub fn get_developer_identity(username: &str) -> String {
-    for var in &["USER_EMAIL", "DEVELOPER_EMAIL", "STEPSEC_DEVELOPER_EMAIL"] {
-        if let Ok(val) = std::env::var(var) {
-            if !val.is_empty() {
-                return val;
-            }
-        }
-    }
-    username.to_string()
-}
-
-pub fn get_logged_in_user_info() -> (String, String) {
-    let logged_in_user = run_command("stat", &["-f%Su", "/dev/console"], None);
-
-    if logged_in_user.is_empty()
-        || logged_in_user == "root"
-        || logged_in_user == "_windowserver"
-    {
-        return (String::new(), String::new());
-    }
-
-    let user_home = run_command(
-        "sh",
-        &[
-            "-c",
-            &format!(
-                "dscl . -read /Users/{} NFSHomeDirectory | awk '{{ print $2 }}'",
-                logged_in_user
-            ),
-        ],
-        None,
-    );
-
-    if user_home.is_empty() || !Path::new(&user_home).is_dir() {
-        return (logged_in_user, String::new());
-    }
-
-    (logged_in_user, user_home)
 }

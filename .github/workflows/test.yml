@@ -4,12 +4,16 @@ on:
   push:
     branches: [main]
     paths:
-      - '*.sh'
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
       - 'tests/**'
   pull_request:
     branches: [main]
     paths:
-      - '*.sh'
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
       - 'tests/**'
 
 permissions: {}
@@ -17,7 +21,7 @@ permissions: {}
 jobs:
   smoke-tests:
     permissions:
-      contents: read  # for actions/checkout to fetch code
+      contents: read
     name: Smoke Tests
     runs-on: macos-latest
     steps:
@@ -27,6 +31,14 @@ jobs:
           egress-policy: audit
 
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # stable
+        with:
+          toolchain: stable
+
+      - name: Build
+        run: cargo build
 
       - name: Run smoke tests
         run: bash tests/test_smoke.sh

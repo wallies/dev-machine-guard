@@ -3,41 +3,37 @@ use std::path::Path;
 use std::time::Instant;
 
 use base64::Engine;
+use walkdir::WalkDir;
 
 use crate::types::*;
 use crate::util::*;
 
 // ─── Package Manager Detection ──────────────────────────────────────────────
 
-pub fn detect_package_managers(logged_in_user: &str, verbose: bool) -> Vec<PackageManager> {
+pub fn detect_package_managers(verbose: bool) -> Vec<PackageManager> {
     print_progress(verbose, "Detecting Node.js package managers...");
     let mut managers = Vec::new();
 
     let checks: &[(&str, &str)] = &[
-        ("npm", "npm --version 2>/dev/null"),
-        ("yarn", "yarn --version 2>/dev/null"),
-        ("pnpm", "pnpm --version 2>/dev/null"),
-        ("bun", "bun --version 2>/dev/null"),
+        ("npm", "--version"),
+        ("yarn", "--version"),
+        ("pnpm", "--version"),
+        ("bun", "--version"),
     ];
 
-    for (name, version_cmd) in checks {
-        let check = run_as_user(
-            logged_in_user,
-            &format!("command -v {} 2>/dev/null && {}", name, version_cmd),
-            10,
-        );
-        if !check.is_empty() {
-            let lines: Vec<&str> = check.lines().collect();
-            let path = lines.first().unwrap_or(&"").to_string();
-            let version = lines.last().unwrap_or(&"unknown").to_string();
+    for (name, flag) in checks {
+        if let Some(path) = which(name) {
+            let version = run_cmd(&path.to_string_lossy(), &[flag]);
+            let version = if version.is_empty() { "unknown".to_string() } else { version };
+            let path_str = path.to_string_lossy().to_string();
 
-            print_progress(verbose, &format!("  Found: {} v{} at {}", name, version, path));
+            print_progress(verbose, &format!("  Found: {} v{} at {}", name, version, path_str));
 
             managers.push(PackageManager {
                 name: name.to_string(),
-                version: if version.is_empty() { "unknown".to_string() } else { version },
+                version,
                 is_global: true,
-                binary_path: path,
+                binary_path: path_str,
             });
         }
     }
@@ -51,16 +47,13 @@ pub fn detect_package_managers(logged_in_user: &str, verbose: bool) -> Vec<Packa
 
 // ─── Global Package Scanning ────────────────────────────────────────────────
 
-pub fn scan_global_packages(logged_in_user: &str, verbose: bool) -> Vec<NodeProjectScan> {
+pub fn scan_global_packages(verbose: bool) -> Vec<NodeProjectScan> {
     print_progress(verbose, "Scanning globally installed packages...");
     let mut scans = Vec::new();
 
-    // npm global
-    scan_npm_global(logged_in_user, verbose, &mut scans);
-    // yarn global
-    scan_yarn_global(logged_in_user, verbose, &mut scans);
-    // pnpm global
-    scan_pnpm_global(logged_in_user, verbose, &mut scans);
+    scan_npm_global(verbose, &mut scans);
+    scan_yarn_global(verbose, &mut scans);
+    scan_pnpm_global(verbose, &mut scans);
 
     if scans.is_empty() {
         print_progress(verbose, "  No globally installed packages found");
@@ -71,22 +64,22 @@ pub fn scan_global_packages(logged_in_user: &str, verbose: bool) -> Vec<NodeProj
     scans
 }
 
-fn scan_npm_global(logged_in_user: &str, verbose: bool, scans: &mut Vec<NodeProjectScan>) {
+fn scan_npm_global(verbose: bool, scans: &mut Vec<NodeProjectScan>) {
     print_progress(verbose, "  Checking npm global packages...");
 
-    let npm_version = run_as_user(logged_in_user, "npm --version 2>/dev/null", 10);
-    let npm_prefix = run_as_user(logged_in_user, "npm config get prefix 2>/dev/null", 10);
+    if which("npm").is_none() {
+        return;
+    }
+
+    let npm_version = run_cmd("npm", &["--version"]);
+    let npm_prefix = run_cmd("npm", &["config", "get", "prefix"]);
 
     if npm_prefix.is_empty() {
         return;
     }
 
     let start = Instant::now();
-    let (stdout, stderr, exit_code) = run_as_user_full(
-        logged_in_user,
-        "npm list -g --json --depth=3 2>&1",
-        60,
-    );
+    let (stdout, stderr, exit_code) = run_cmd_stdout("npm", &["list", "-g", "--json", "--depth=3"]);
 
     let duration = start.elapsed().as_millis() as u64;
     let error = if exit_code != 0 {
@@ -108,19 +101,26 @@ fn scan_npm_global(logged_in_user: &str, verbose: bool, scans: &mut Vec<NodeProj
     });
 }
 
-fn scan_yarn_global(logged_in_user: &str, verbose: bool, scans: &mut Vec<NodeProjectScan>) {
+fn scan_yarn_global(verbose: bool, scans: &mut Vec<NodeProjectScan>) {
     print_progress(verbose, "  Checking yarn global packages...");
 
-    let yarn_version = run_as_user(logged_in_user, "yarn --version 2>/dev/null", 10);
-    let yarn_global_dir = run_as_user(logged_in_user, "yarn global dir 2>/dev/null", 10);
+    if which("yarn").is_none() {
+        return;
+    }
+
+    let yarn_version = run_cmd("yarn", &["--version"]);
+    let yarn_global_dir = run_cmd("yarn", &["global", "dir"]);
 
     if yarn_global_dir.is_empty() {
         return;
     }
 
     let start = Instant::now();
-    let cmd = format!("cd '{}' && yarn list --json --depth=0 2>&1", yarn_global_dir);
-    let (stdout, stderr, exit_code) = run_as_user_full(logged_in_user, &cmd, 60);
+    let (stdout, stderr, exit_code) = run_cmd_in_dir(
+        "yarn",
+        &["list", "--json", "--depth=0"],
+        &yarn_global_dir,
+    );
 
     let duration = start.elapsed().as_millis() as u64;
     let error = if exit_code != 0 {
@@ -142,11 +142,15 @@ fn scan_yarn_global(logged_in_user: &str, verbose: bool, scans: &mut Vec<NodePro
     });
 }
 
-fn scan_pnpm_global(logged_in_user: &str, verbose: bool, scans: &mut Vec<NodeProjectScan>) {
+fn scan_pnpm_global(verbose: bool, scans: &mut Vec<NodeProjectScan>) {
     print_progress(verbose, "  Checking pnpm global packages...");
 
-    let pnpm_version = run_as_user(logged_in_user, "pnpm --version 2>/dev/null", 10);
-    let pnpm_global_dir = run_as_user(logged_in_user, "pnpm root -g 2>/dev/null", 10);
+    if which("pnpm").is_none() {
+        return;
+    }
+
+    let pnpm_version = run_cmd("pnpm", &["--version"]);
+    let pnpm_global_dir = run_cmd("pnpm", &["root", "-g"]);
 
     if pnpm_global_dir.is_empty() {
         return;
@@ -159,11 +163,7 @@ fn scan_pnpm_global(logged_in_user: &str, verbose: bool, scans: &mut Vec<NodePro
         .unwrap_or(pnpm_global_dir.clone());
 
     let start = Instant::now();
-    let (stdout, stderr, exit_code) = run_as_user_full(
-        logged_in_user,
-        "pnpm list -g --json --depth=3 2>&1",
-        60,
-    );
+    let (stdout, stderr, exit_code) = run_cmd_stdout("pnpm", &["list", "-g", "--json", "--depth=3"]);
 
     let duration = start.elapsed().as_millis() as u64;
     let error = if exit_code != 0 {
@@ -188,7 +188,7 @@ fn scan_pnpm_global(logged_in_user: &str, verbose: bool, scans: &mut Vec<NodePro
 // ─── Node.js Project Scanning ───────────────────────────────────────────────
 
 fn detect_project_package_manager(project_dir: &str) -> &'static str {
-    if project_dir.contains("/.bun/install/") {
+    if project_dir.contains("/.bun/install/") || project_dir.contains("\\.bun\\install\\") {
         return "bun";
     }
 
@@ -210,22 +210,24 @@ fn detect_project_package_manager(project_dir: &str) -> &'static str {
     }
 }
 
-fn get_pm_version(pm: &str, logged_in_user: &str) -> String {
-    let cmd = match pm {
-        "npm" => "npm --version 2>/dev/null",
-        "yarn" | "yarn-berry" => "yarn --version 2>/dev/null",
-        "pnpm" => "pnpm --version 2>/dev/null",
-        "bun" => "bun --version 2>/dev/null",
+fn get_pm_version(pm: &str) -> String {
+    let binary = match pm {
+        "npm" => "npm",
+        "yarn" | "yarn-berry" => "yarn",
+        "pnpm" => "pnpm",
+        "bun" => "bun",
         _ => return "unknown".to_string(),
     };
-    let ver = run_as_user(logged_in_user, cmd, 10);
+    if which(binary).is_none() {
+        return "unknown".to_string();
+    }
+    let ver = run_cmd(binary, &["--version"]);
     if ver.is_empty() { "unknown".to_string() } else { ver }
 }
 
 fn list_project_packages(
     project_dir: &str,
     package_manager: &str,
-    logged_in_user: &str,
 ) -> Option<NodeProjectScan> {
     // Check node_modules for most package managers
     match package_manager {
@@ -240,31 +242,20 @@ fn list_project_packages(
 
     let start = Instant::now();
 
-    let list_cmd = match package_manager {
-        "npm" => format!(
-            "cd '{}' && command -v npm >/dev/null 2>&1 && npm ls --json --depth=3 2>&1 || echo 'npm command failed'",
-            project_dir
-        ),
-        "yarn" => format!(
-            "cd '{}' && command -v yarn >/dev/null 2>&1 && yarn list --json 2>&1 || echo 'yarn command failed'",
-            project_dir
-        ),
-        "yarn-berry" => format!(
-            "cd '{}' && command -v yarn >/dev/null 2>&1 && yarn info --all --json 2>&1 || echo 'yarn command failed'",
-            project_dir
-        ),
-        "pnpm" => format!(
-            "cd '{}' && command -v pnpm >/dev/null 2>&1 && pnpm ls --json --depth=3 2>&1 || echo 'pnpm command failed'",
-            project_dir
-        ),
-        "bun" => format!(
-            "cd '{}' && command -v bun >/dev/null 2>&1 && bun pm ls --all 2>&1 || echo 'bun command failed'",
-            project_dir
-        ),
+    let (binary, args): (&str, Vec<&str>) = match package_manager {
+        "npm" => ("npm", vec!["ls", "--json", "--depth=3"]),
+        "yarn" => ("yarn", vec!["list", "--json"]),
+        "yarn-berry" => ("yarn", vec!["info", "--all", "--json"]),
+        "pnpm" => ("pnpm", vec!["ls", "--json", "--depth=3"]),
+        "bun" => ("bun", vec!["pm", "ls", "--all"]),
         _ => return None,
     };
 
-    let (stdout, stderr, exit_code) = run_as_user_full(logged_in_user, &list_cmd, 60);
+    if which(binary).is_none() {
+        return None;
+    }
+
+    let (stdout, stderr, exit_code) = run_cmd_in_dir(binary, &args, project_dir);
     let duration = start.elapsed().as_millis() as u64;
 
     let error = if exit_code != 0 {
@@ -287,28 +278,34 @@ fn list_project_packages(
 }
 
 /// Check if a path is a global package directory
-fn is_global_package_directory(check_path: &str, logged_in_user: &str) -> bool {
+fn is_global_package_directory(check_path: &str) -> bool {
     // Check npm prefix
-    let npm_prefix = run_as_user(logged_in_user, "npm config get prefix 2>/dev/null", 10);
-    if !npm_prefix.is_empty() && check_path.starts_with(&npm_prefix) {
-        return true;
+    if which("npm").is_some() {
+        let npm_prefix = run_cmd("npm", &["config", "get", "prefix"]);
+        if !npm_prefix.is_empty() && check_path.starts_with(&npm_prefix) {
+            return true;
+        }
     }
 
     // Check yarn global dir
-    let yarn_dir = run_as_user(logged_in_user, "yarn global dir 2>/dev/null", 10);
-    if !yarn_dir.is_empty() && check_path.starts_with(&yarn_dir) {
-        return true;
+    if which("yarn").is_some() {
+        let yarn_dir = run_cmd("yarn", &["global", "dir"]);
+        if !yarn_dir.is_empty() && check_path.starts_with(&yarn_dir) {
+            return true;
+        }
     }
 
     // Check pnpm global dir
-    let pnpm_root = run_as_user(logged_in_user, "pnpm root -g 2>/dev/null", 10);
-    if !pnpm_root.is_empty() {
-        let pnpm_dir = Path::new(&pnpm_root)
-            .parent()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or(pnpm_root);
-        if check_path.starts_with(&pnpm_dir) {
-            return true;
+    if which("pnpm").is_some() {
+        let pnpm_root = run_cmd("pnpm", &["root", "-g"]);
+        if !pnpm_root.is_empty() {
+            let pnpm_dir = Path::new(&pnpm_root)
+                .parent()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or(pnpm_root);
+            if check_path.starts_with(&pnpm_dir) {
+                return true;
+            }
         }
     }
 
@@ -317,7 +314,6 @@ fn is_global_package_directory(check_path: &str, logged_in_user: &str) -> bool {
 
 pub fn scan_node_projects(
     search_dir: &str,
-    logged_in_user: &str,
     verbose: bool,
 ) -> (Vec<NodeProjectScan>, usize) {
     print_progress(verbose, "Searching for Node.js projects...");
@@ -334,21 +330,37 @@ pub fn scan_node_projects(
 
     print_progress(verbose, &format!("  Searching in: {}", search_dir));
 
-    // Find package.json files, excluding node_modules, sorted by mtime (most recent first)
-    let (find_output, _, _) = run_shell(
-        &format!(
-            "find '{}' -name 'package.json' -type f 2>/dev/null | grep -v '/node_modules/' | while IFS= read -r f; do stat -f '%m %N' \"$f\" 2>/dev/null; done | sort -rn | cut -d' ' -f2-",
-            search_dir
-        ),
-        120,
-    );
+    // Use walkdir to find package.json files, collect with mtimes for sorting
+    let mut package_jsons: Vec<(std::time::SystemTime, String)> = Vec::new();
 
-    for package_json in find_output.lines() {
-        let package_json = package_json.trim();
-        if package_json.is_empty() {
-            continue;
+    for entry in WalkDir::new(search_dir)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| {
+            // Skip node_modules directories during traversal
+            let name = e.file_name().to_string_lossy();
+            name != "node_modules" && name != ".git" && name != ".cache"
+        })
+    {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        if entry.file_type().is_file() && entry.file_name() == "package.json" {
+            let mtime = entry
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            package_jsons.push((mtime, entry.path().to_string_lossy().to_string()));
         }
+    }
 
+    // Sort by mtime descending (most recent first)
+    package_jsons.sort_by(|a, b| b.0.cmp(&a.0));
+
+    for (_mtime, package_json) in &package_jsons {
         let project_dir = match Path::new(package_json).parent() {
             Some(p) => p.to_string_lossy().to_string(),
             None => continue,
@@ -369,7 +381,7 @@ pub fn scan_node_projects(
         }
 
         // Skip global package directories
-        if is_global_package_directory(&project_dir, logged_in_user) {
+        if is_global_package_directory(&project_dir) {
             print_progress(verbose, &format!("    Skipping global package directory: {}", project_dir));
             continue;
         }
@@ -381,9 +393,9 @@ pub fn scan_node_projects(
         let pm = detect_project_package_manager(&project_dir);
         print_progress(verbose, &format!("      Package manager: {}", pm));
 
-        let pm_version = get_pm_version(pm, logged_in_user);
+        let pm_version = get_pm_version(pm);
 
-        let scan_result = match list_project_packages(&project_dir, pm, logged_in_user) {
+        let scan_result = match list_project_packages(&project_dir, pm) {
             Some(mut scan) => {
                 scan.package_manager_version = Some(pm_version);
                 scan
