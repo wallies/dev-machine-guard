@@ -41,27 +41,35 @@ pub fn acquire_lock() -> Result<(), String> {
     let lock_file = get_lock_file_path();
     let my_pid = std::process::id();
 
-    if Path::new(&lock_file).exists() {
-        if let Ok(contents) = fs::read_to_string(&lock_file) {
-            if let Ok(existing_pid) = contents.trim().parse::<u32>() {
-                // Check if process is still running
-                let still_running = is_pid_running(existing_pid);
-                if still_running {
-                    return Err(format!(
-                        "Another instance is already running (PID: {})",
-                        existing_pid
-                    ));
-                }
-                // Stale lock, remove it
-                let _ = fs::remove_file(&lock_file);
+    // Check for existing lock and stale PIDs
+    if let Ok(contents) = fs::read_to_string(&lock_file) {
+        if let Ok(existing_pid) = contents.trim().parse::<u32>() {
+            if is_pid_running(existing_pid) {
+                return Err(format!(
+                    "Another instance is already running (PID: {})",
+                    existing_pid
+                ));
             }
+            // Stale lock, remove it
+            let _ = fs::remove_file(&lock_file);
         }
     }
 
-    // Write our PID
-    if let Ok(mut f) = fs::File::create(&lock_file) {
-        let _ = write!(f, "{}", my_pid);
-    }
+    // Atomic lock creation using create_new to avoid TOCTOU
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock_file)
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                "Another instance is already running (lock file exists)".to_string()
+            } else {
+                format!("Failed to create lock file: {}", e)
+            }
+        })?;
+
+    write!(f, "{}", my_pid)
+        .map_err(|e| format!("Failed to write PID to lock file: {}", e))?;
 
     Ok(())
 }
@@ -453,6 +461,17 @@ fn is_task_scheduler_configured() -> bool {
 
 // ─── Telemetry Upload (using ureq) ──────────────────────────────────────────
 
+/// HTTP timeout for API requests (30 seconds).
+const HTTP_TIMEOUT_SECS: u64 = 30;
+/// HTTP timeout for S3 upload (120 seconds).
+const HTTP_UPLOAD_TIMEOUT_SECS: u64 = 120;
+
+fn http_agent(timeout_secs: u64) -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .build()
+}
+
 fn upload_telemetry(
     device_id: &str,
     payload_json: &str,
@@ -467,16 +486,18 @@ fn upload_telemetry(
 
     let request_body = serde_json::json!({ "device_id": device_id });
 
-    let response = ureq::post(&upload_url_endpoint)
+    let agent = http_agent(HTTP_TIMEOUT_SECS);
+
+    let response = agent.post(&upload_url_endpoint)
         .set("Content-Type", "application/json")
         .set("Authorization", &format!("Bearer {}", config.api_key))
         .set("X-Agent-Version", AGENT_VERSION)
         .send_json(&request_body)
-        .map_err(|e| format!("Failed to request upload URL: {}", e))?;
+        .map_err(|_| "Failed to request upload URL".to_string())?;
 
     let response_json: serde_json::Value = response
         .into_json()
-        .map_err(|e| format!("Failed to parse upload URL response: {}", e))?;
+        .map_err(|_| "Failed to parse upload URL response".to_string())?;
 
     let upload_url = response_json
         .get("upload_url")
@@ -492,10 +513,11 @@ fn upload_telemetry(
 
     eprintln!("Uploading telemetry to S3...");
 
-    let upload_response = ureq::put(&upload_url)
+    let upload_agent = http_agent(HTTP_UPLOAD_TIMEOUT_SECS);
+    let upload_response = upload_agent.put(&upload_url)
         .set("Content-Type", "application/json")
         .send_string(payload_json)
-        .map_err(|e| format!("Failed to upload to S3: {}", e))?;
+        .map_err(|_| "Failed to upload to S3".to_string())?;
 
     if upload_response.status() != 200 {
         return Err(format!("Failed to upload to S3 (HTTP {})", upload_response.status()));
@@ -514,12 +536,12 @@ fn upload_telemetry(
         "device_id": device_id,
     });
 
-    let notify_response = ureq::post(&process_endpoint)
+    let notify_response = agent.post(&process_endpoint)
         .set("Content-Type", "application/json")
         .set("Authorization", &format!("Bearer {}", config.api_key))
         .set("X-Agent-Version", AGENT_VERSION)
         .send_json(&notify_body)
-        .map_err(|e| format!("Failed to notify backend: {}", e))?;
+        .map_err(|_| "Failed to notify backend".to_string())?;
 
     let status = notify_response.status();
     if status == 200 || status == 201 {

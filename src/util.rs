@@ -144,6 +144,7 @@ pub fn html_escape(s: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+        .replace('\'', "&#x27;")
 }
 
 /// Print progress message to stderr.
@@ -158,10 +159,15 @@ pub fn print_error(msg: &str) {
     eprintln!("\x1b[0;31m[error]\x1b[0m {}", msg);
 }
 
-/// Truncate a string with "..." suffix.
+/// Truncate a string with "..." suffix. UTF-8 safe.
 pub fn truncate(s: &str, max: usize) -> String {
     if s.len() > max && max > 3 {
-        format!("{}...", &s[..max - 3])
+        // Find a valid UTF-8 boundary at or before max-3
+        let mut end = max - 3;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}...", &s[..end])
     } else {
         s.to_string()
     }

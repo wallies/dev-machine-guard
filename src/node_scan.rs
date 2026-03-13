@@ -335,6 +335,7 @@ pub fn scan_node_projects(
 
     for entry in WalkDir::new(search_dir)
         .follow_links(false)
+        .max_depth(20)
         .into_iter()
         .filter_entry(|e| {
             // Skip node_modules directories during traversal
@@ -454,7 +455,7 @@ pub fn extract_packages_from_scans(scans: &[NodeProjectScan]) -> Vec<NodePackage
 
         // Try to parse as JSON for npm/pnpm
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(&decoded) {
-            extract_npm_packages(&value, &mut packages, &mut seen);
+            extract_npm_packages(&value, &mut packages, &mut seen, 0);
         }
 
         // If no packages found, try yarn JSON format
@@ -512,11 +513,17 @@ pub fn extract_packages_from_scans(scans: &[NodeProjectScan]) -> Vec<NodePackage
     folders
 }
 
+const MAX_NPM_RECURSION_DEPTH: usize = 16;
+
 fn extract_npm_packages(
     value: &serde_json::Value,
     packages: &mut Vec<NodePackageEntry>,
     seen: &mut HashSet<String>,
+    depth: usize,
 ) {
+    if depth > MAX_NPM_RECURSION_DEPTH {
+        return;
+    }
     if let Some(deps) = value.get("dependencies").and_then(|d| d.as_object()) {
         for (name, info) in deps {
             if let Some(version) = info.get("version").and_then(|v| v.as_str()) {
@@ -529,7 +536,7 @@ fn extract_npm_packages(
                 }
             }
             // Recurse into nested dependencies
-            extract_npm_packages(info, packages, seen);
+            extract_npm_packages(info, packages, seen, depth + 1);
         }
     }
 }

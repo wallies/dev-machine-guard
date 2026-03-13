@@ -328,7 +328,7 @@ pub fn generate_html_report(output_file: &str, results: &ScanResults) -> io::Res
             };
             format!(
                 r#"<tr><td>{}</td><td>{}</td><td><span style="background:#f0ebff;color:#7037f5;padding:2px 8px;border-radius:10px;font-size:0.8em;">{}</span></td><td>{}</td></tr>"#,
-                html_escape(&t.name), html_escape(&t.version), type_label, html_escape(&t.vendor)
+                html_escape(&t.name), html_escape(&t.version), html_escape(type_label), html_escape(&t.vendor)
             )
         }).collect::<Vec<_>>().join("\n    ")
     };
@@ -350,7 +350,7 @@ pub fn generate_html_report(output_file: &str, results: &ScanResults) -> io::Res
             };
             format!(
                 r#"<tr><td>{}</td><td>{}</td><td>{}</td><td style="color:#8a94a6;font-size:0.85em;">{}</td></tr>"#,
-                display_name, html_escape(&ide.version), html_escape(&ide.vendor), html_escape(&ide.install_path)
+                html_escape(display_name), html_escape(&ide.version), html_escape(&ide.vendor), html_escape(&ide.install_path)
             )
         }).collect::<Vec<_>>().join("\n    ")
     };
@@ -377,7 +377,7 @@ pub fn generate_html_report(output_file: &str, results: &ScanResults) -> io::Res
             };
             format!(
                 "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-                html_escape(&e.id), html_escape(&e.version), html_escape(&e.publisher), ide_display
+                html_escape(&e.id), html_escape(&e.version), html_escape(&e.publisher), html_escape(ide_display)
             )
         }).collect::<Vec<_>>().join("\n    ")
     };

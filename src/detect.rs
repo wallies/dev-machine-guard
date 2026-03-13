@@ -445,6 +445,16 @@ pub fn collect_mcp_configs(is_enterprise: bool, verbose: bool) -> Vec<McpConfig>
             continue;
         }
 
+        // Cap file reads at 10MB to prevent memory exhaustion
+        let metadata = match fs::metadata(&config_path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if metadata.len() > 10 * 1024 * 1024 {
+            print_progress(verbose, &format!("  Skipping {}: file too large ({}B)", source.source_name, metadata.len()));
+            continue;
+        }
+
         let content = match fs::read_to_string(&config_path) {
             Ok(c) if !c.is_empty() => c,
             _ => {
