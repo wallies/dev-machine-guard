@@ -62,6 +62,5 @@ jobs:
       - name: Build
         run: cargo build
 
-      - name: Run smoke tests
-        if: runner.os != 'Windows'
-        run: bash tests/test_smoke.sh
+      - name: Run tests
+        run: cargo test
